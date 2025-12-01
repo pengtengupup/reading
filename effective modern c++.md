@@ -66,7 +66,6 @@ w1 = w2;                //是赋值运算，调用拷贝赋值运算符（copy o
   TimeKeeper time_keeper( /*Avoid MVP*/ (Timer()) );
   TimeKeeper time_keeper = TimeKeeper(Timer());
   ```
-
 - 使用花括号初始化的问题在于编译器会尽最大努力将括号初始化与std::initializer_list参数匹配，即便其他构造函数看起来是更好的选择
 - 默认使用圆括号初始化的开发者主要被C++98语法一致性、避免std::initializer_list自动类型推导、避免不会不经意间调用std::initializer_list构造函数这些优点所吸引。这些开发者也承认有时候只能使用花括号（比如创建一个包含着特定值的容器）
 
@@ -643,7 +642,6 @@ auto func = std::bind([](const std::vector<double>& data){/*使用data*/},
 默认情况下，从lambda生成的闭包类中的operator()成员函数为const的(除非将lambda声明为mutable)。
 
 - 无法移动构造一个对象到C++11闭包，但是可以将对象移动构造进C++11的bind对象。
-
 - 在C++11中模拟移动捕获包括将对象移动构造进bind对象，然后通过传引用将移动构造的对象传递给lambda。
 - 由于bind对象的生命周期与闭包对象的生命周期相同，因此可以将bind对象中的对象视为闭包中的对象。
 
@@ -775,3 +773,248 @@ long long parallel_sum(const std::vector<int>& v) {
 std::async的默认启动策略是异步和同步执行兼有的。
 这个灵活性导致访问thread_locals的不确定性，隐含了任务可能不会被执行的意思，会影响调用基于超时的wait的程序逻辑。
 如果异步执行任务非常关键，则指定std::launch::async。
+
+### item37：保证thread最终是unjoinable
+
+joinable: 检查线程是否可被 join。检查当前的线程对象是否表示了一个活动的执行线程，由默认构造函数创建的线程是不能被 join 的。另外，如果某个线程 已经执行完任务，但是没有被 join 的话，该线程依然会被认为是一个活动的执行线程，因此也是可以被 join 的。
+
+join：会使当前线程阻塞，直到目标线程执行完毕；只有处于活动状态线程才能调用join；join只能被调用一次，之后joinable就会变为false，表示线程执行完毕；如果线程不调用join()函数，即使执行完毕也是一个活动线程，即joinable() == true，依然可以调用join()函数；
+
+detach: Detach 线程。 将当前线程对象所代表的执行实例(操作系统线程)与该线程对象分离，使得线程的执行可以单独进行。一旦线程执行完毕，它所分配的资源将会被释放。调用detach后joinable() == false
+
+unjoinable的thread包括：
+
+- 默认构造的thread。
+- 已经被move走的std::thread对象。
+- 已经被join 的thread。
+- 已经被detach的thread。
+
+**当可结合的线程的析构函数被调用，程序执行会终止！**
+
+每当你想在执行跳至块之外的每条路径执行某种操作，最通用的方式就是将该操作放入局部对象的析构函数中。这些对象称为RAII对象（RAII objects），从RAII类中实例化。
+
+```c_cpp
+class ThreadRAII {
+public:
+    enum class DtorAction { join, detach };     //enum class的信息见条款10
+    
+    ThreadRAII(std::thread&& t, DtorAction a)   //析构函数中对t实行a动作
+    : action(a), t(std::move(t)) {}
+
+    ~ThreadRAII()
+    {                                           //可结合性测试见下
+        if (t.joinable()) {
+            if (action == DtorAction::join) {
+                t.join();
+            } else {
+                t.detach();
+            }
+        }
+    }
+
+    std::thread& get() { return t; }            //见下
+
+private:
+    DtorAction action;
+    std::thread t;
+};
+
+```
+
+### item38：了解不同线程的析构行为
+
+背景：异步执行时，被调用者（通常是异步执行）将计算结果写入通信信道中（通常通过std::promise对象），调用者使用future读取结果。因为与被调用者关联的对象和与调用者关联的对象都不适合存储这个结果，所以必须存储在两者之外的位置。此位置称为共享状态（shared state）。
+
+因此future的析构行为取决于与future关联的共享状态：
+
+- 引用了共享状态（使用std::async启动的未延迟任务建立的）的最后一个future的析构函数会阻塞住，直到任务完成。本质上，这种future的析构函数对执行异步任务的线程执行了隐式的join。
+
+- 其余所有future的正常析构行为就是销毁future本身的数据成员。对于异步执行的任务，就像对底层的线程执行detach。对于延迟任务来说如果这是最后一个future，意味着这个延迟任务永远不会执行了。
+
+什么时候会出现异常析构：
+
+- 它关联到由于调用std::async而创建出的共享状态。
+- 任务的启动策略是std::launch::async。
+- 这个future是关联共享状态的最后一个future。对于std::future，情况总是如此。
+
+future的API没办法确定是否future引用了一个std::async调用产生的共享状态，因此需要程序员自己判断，如果可能会在析构的时候阻塞，可以使用std::packaged_task来异步执行防止阻塞。
+
+### item39：对于一次性事件通信考虑使用void的futures
+
+背景：有时，一个任务通知另一个异步执行的任务发生了特定的事件很有用，因为第二个任务要等到这个事件发生之后才能继续执行。
+
+最佳方案：使用条件变量（condition variable)。如果我们将检测条件的任务称为检测任务（detecting task），对条件作出反应的任务称为反应任务（reacting task），策略很简单：反应任务等待一个条件变量，检测任务在事件发生时改变条件变量。代码如下：
+
+```c_cpp
+// 反应任务
+std::condition_variable cv;
+std::mutex m;
+....
+cv.notify_one();
+
+// 检测任务
+std::unique_loack<std::mutex> lk(m);
+cv.wait(lk);
+```
+
+注意：
+
+- 如果在反应任务wait之前检测任务就通知了条件变量，反应任务就会丢失这次通知，永远不被唤醒。
+- 线程API的存在一个事实，等待一个条件变量的代码即使在条件变量没有被通知时，也可能被唤醒，这种唤醒被称为虚假唤醒（spurious wakeups）。正确的代码通过确认要等待的条件确实已经发生来处理这种情况，并将这个操作作为唤醒后的第一个操作。C++条件变量的API允许把一个测试要等待的条件的lambda（或者其他函数对象）传给wait。
+
+在很多情况下，使用条件变量进行任务通信非常合适，但是也有不那么合适的情况。
+
+对于很多开发者来说，他们的下一个诀窍是共享的布尔型flag。
+
+```
+std::atomic<bool> flag(false);          //共享的flag；std::atomic见条款40
+…                                       //检测某个事件
+flag = true;                            //告诉反应线程
+
+...
+while(!flag); // 等待事件
+...
+```
+
+这种方法不存在基于条件变量的设计的缺点。不需要互斥锁，在反应任务开始轮询之前检测任务就对flag置位也不会出现问题，并且不会出现虚假唤醒。
+
+不好的一点是反应任务中轮询的开销。这样，反应线程占用了可能能给另一个任务使用的硬件线程，每次启动或者完成它的时间片都增加了上下文切换的开销，并且保持核心一直在运行状态，否则的话本来可以停下来省电。这也是基于条件变量的优点，因为wait调用中的任务真的阻塞住了。
+
+将条件变量和flag的设计组合起来很常用。一个flag表示是否发生了感兴趣的事件，但是通过互斥锁同步了对该flag的访问。因为互斥锁阻止并发访问该flag，所以如Item40所述，不需要将flag设置为std::atomic。
+
+```c_cpp
+std::condition_variable cv;             //跟之前一样
+std::mutex m;
+bool flag(false);                       //不是std::atomic
+…                                       //检测某个事件
+{
+    std::lock_guard<std::mutex> g(m);   //通过g的构造函数锁住m
+    flag = true;                        //通知反应任务（第1部分）
+}                                       //通过g的析构函数解锁m
+cv.notify_one();                        //通知反应任务（第2部分）
+
+// 反应任务
+…                                       //准备作出反应
+{                                       //跟之前一样
+    std::unique_lock<std::mutex> lk(m); //跟之前一样
+    cv.wait(lk, [] { return flag; });   //使用lambda来避免虚假唤醒
+    …                                   //对事件作出反应（m被锁定）
+}
+…                                       //继续反应动作（m现在解锁）
+
+```
+
+一个替代方案是让反应任务通过在检测任务设置的future上wait来避免使用条件变量，互斥锁和flag。
+
+方案很简单。检测任务有一个std::promise对象（即通信信道的写入端），反应任务有对应的future。当检测任务看到事件已经发生，设置std::promise对象（即写入到通信信道）。同时，wait会阻塞住反应任务直到std::promise被设置。
+
+```c_cpp
+std::promise<void> p;
+
+...
+p.set_value();
+
+// 反应任务
+...
+p.get_future().wait();
+...
+```
+
+在这里，没有数据被传递，只需要让反应任务知道它的future已经被设置了。因此使用void。
+
+缺点：std::promise只能设置一次。std::promise和future之间的通信是一次性的：不能重复使用。
+
+总结：
+
+- 对于简单的事件通信，基于条件变量的设计需要一个多余的互斥锁，对检测和反应任务的相对进度有约束，并且需要反应任务来验证事件是否已发生。
+- 基于flag的设计避免的上一条的问题，但是是基于轮询，而不是阻塞。
+- 条件变量和flag可以组合使用，但是产生的通信机制很不自然。
+- 使用std::promise和future的方案避开了这些问题，但是这个方法使用了堆内存存储共享状态，同时有只能使用一次通信的限制。
+
+### item40：对于并发使用std::atomic，对于特殊内存使用volatile
+
+std::atomic模板。这种模板的实例化（比如，std::atomic<int>，std::atomic<bool>，std::atomic<Widget*>等）提供了一种在其他线程看来操作是原子性的的保证。通常这些操作是使用特定的机器指令实现，这比锁的实现更高效。std::atomic会限制不合理的重排序
+
+volatile并不会防止指令重拍与操作原子性。它是用来告诉编译器，它们处理的内存有不正常的表现。
+
+- std::atomic用于在不使用互斥锁情况下，来使变量被多个线程访问的情况。是用来编写并发程序的一个工具。
+
+- volatile用在读取和写入不应被优化掉的内存上。是用来处理特殊内存的一个工具。
+
+## 其他
+
+### item41：对于可移动且总是被拷贝的形参使用传值方式
+
+对于可拷贝，移动开销低，而且无条件被拷贝的形参，按值传递效率基本与按引用传递效率一致，而且易于实现，还生成更少的目标代码。
+
+```c_cpp
+class Widget {                                  //方法1：对左值和右值重载
+public:
+    void addName(const std::string& newName)
+    { names.push_back(newName); } // rvalues
+    void addName(std::string&& newName)
+    { names.push_back(std::move(newName)); }
+    …
+private:
+    std::vector<std::string> names;
+};
+
+class Widget {                                  //方法2：使用通用引用
+public:
+    template<typename T>
+    void addName(T&& newName)
+    { names.push_back(std::forward<T>(newName)); }
+    …
+};
+
+class Widget {                                  //方法3：传值
+public:
+    void addName(std::string newName)
+    { names.push_back(std::move(newName)); }
+    …
+};
+
+```
+
+上述三种传参方式开销：
+
+重载：无论传递左值还是传递右值，调用都会绑定到一个叫newName的引用上。从拷贝和移动操作方面看，这个过程零开销。左值重载中，newName拷贝到Widget::names中，右值重载中，移动进去。**开销总结：左值一次拷贝，右值一次移动。**
+
+使用通用引用：同重载一样，调用也绑定到addName这个引用上，没有开销。由于使用了std::forward，左值std::string实参会拷贝到Widget::names，右值std::string实参移动进去。对std::string实参来说，开销同重载方式一样：**左值一次拷贝，右值一次移动。**
+
+按值传递：无论传递左值还是右值，都必须构造newName形参。如果传递的是左值，需要拷贝的开销，如果传递的是右值，需要移动的开销。在函数的实现中，newName总是采用移动的方式到Widget::names。开销总结：左值实参，一次拷贝一次移动，右值实参两次移动。对比按引用传递的方法，对于左值或者右值，均多出一次移动操作。
+
+### item42：考虑使用置入代替插入
+
+考虑到：
+
+```
+vs.push_back("xyzzy");
+```
+
+编译器处理的这个调用应该像这样：
+
+vs.push_back(std::string("xyzzy")); //创建临时std::string，把它传给push_back
+
+为了在std::string容器中创建新元素，调用了std::string的构造函数，但是这份代码并不仅调用了一次构造函数，而是调用了两次，而且还调用了std::string析构函数。
+
+1. 一个std::string的临时对象从字面量“xyzzy”被创建。这个对象没有名字，我们可以称为temp。temp的构造是第一次std::string构造。因为是临时变量，所以temp是右值。
+2. emp被传递给push_back的右值重载函数，绑定到右值引用形参x。在std::vector的内存中一个x的副本被创建。这次构造——也是第二次构造——在std::vector内部真正创建一个对象。（将x副本拷贝到std::vector内部的构造函数是移动构造函数，因为x在它被拷贝前被转换为一个右值，成为右值引用。）
+3. 在push_back返回之后，temp立刻被销毁，调用了一次std::string的析构函数。
+
+是否存在一种方法可以获取字符串字面量并将其直接传入到步骤2里在std::vector内构造std::string的代码中，可以避免临时对象temp的创建与销毁。
+
+emplace_back就是像我们想要的那样做的：使用传递给它的任何实参直接在std::vector内部构造一个std::string。
+
+使得置入（emplacement）函数功能优于插入函数的原因是它们有灵活的接口。**插入函数接受对象去插入，而置入函数接受对象的构造函数接受的实参去插入。**这种差异允许置入函数避免插入函数所必需的临时对象的创建和销毁。
+
+```
+vs.emplace_back("xyzzy");           //直接用“xyzzy”在vs内构造std::string
+vs.emplace_back(50, 'x');           //插入由50个“x”组成的一个std::string
+```
+
+选择置入而非插入的动机是避免容器元素类型的临时对象的开销。什么时候会有效：
+
+（1）值被构造到容器中，而不是直接赋值；（传递的是构造参数）（2）传入的类型与容器的元素类型不一致；（3）容器不拒绝已经存在的重复值。
+
+什么时候一致：1：传入的已经是目标类型对象。2：类型是简单 POD（Plain Old Data。3：需要显式类型转换。
